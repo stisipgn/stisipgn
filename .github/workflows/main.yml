@@ -5,17 +5,19 @@ on:
 
 jobs:
   macos-vnc:
-    runs-on: self-hosted  # 🧠 ganti dengan label runner-mu (misal: self-hosted, macos, personal)
-    timeout-minutes: 43200  # 30 hari (praktis unlimited)
+    runs-on: self-hosted
+    timeout-minutes: 2000 # 43200 30 hari (praktis unlimited)
 
     steps:
       - name: Show macOS Info
+        shell: bash
         run: |
           echo "=== macOS Info ==="
           sw_vers
           uname -a
 
       - name: Install Tailscale (macOS)
+        shell: bash
         run: |
           echo "Downloading latest Tailscale package..."
           curl -fsSL -o tailscale.pkg https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg
@@ -25,14 +27,16 @@ jobs:
           /Applications/Tailscale.app/Contents/MacOS/tailscale version
 
       - name: Start Tailscale Daemon
+        shell: bash
         run: |
           sudo /Applications/Tailscale.app/Contents/MacOS/tailscaled &
+          sleep 5
 
       - name: Connect to Tailscale Network
+        shell: bash
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          sleep 3
           sudo /Applications/Tailscale.app/Contents/MacOS/tailscale up \
             --authkey=${TS_AUTHKEY} \
             --hostname=selfhosted-macos-${{ github.run_id }} \
@@ -41,23 +45,26 @@ jobs:
           echo "✅ Connected to Tailscale network!"
 
       - name: Verify Tailscale
+        shell: bash
         run: |
           echo "🔍 Checking Tailscale status..."
           /Applications/Tailscale.app/Contents/MacOS/tailscale status
           echo "Tailscale IP: $TAILSCALE_IP"
 
       - name: Create GUI User
+        shell: bash
         run: |
           USERNAME="guiuser"
           PASSWORD=$(openssl rand -base64 12)
+          echo "::add-mask::$PASSWORD"
           sudo sysadminctl -addUser $USERNAME -password $PASSWORD
           sudo dscl . -append /Groups/admin GroupMembership $USERNAME
           echo "GUI_USER=$USERNAME" >> $GITHUB_ENV
           echo "GUI_PASS=$PASSWORD" >> $GITHUB_ENV
           echo "Created user: $USERNAME"
-          echo "Password: $PASSWORD"
 
       - name: Enable VNC Access
+        shell: bash
         run: |
           echo "🔧 Enabling Screen Sharing..."
           sudo systemsetup -setremotedesktop on
@@ -75,6 +82,7 @@ jobs:
           echo "✅ Screen Sharing enabled (port 5900)"
 
       - name: Display Access Info
+        shell: bash
         run: |
           echo "=============================================="
           echo "🍏 macOS GUI Remote Ready via Tailscale!"
