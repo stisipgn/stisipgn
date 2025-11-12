@@ -1,32 +1,52 @@
-name: macOS_GUI_Remote
+name: macOS_GUI_Remote_SelfHosted
 
 on:
   workflow_dispatch:
 
 jobs:
   macos-vnc:
-    runs-on: macos-15  # macOS Sequoia
-    timeout-minutes: 360
+    runs-on: self-hosted  # 🧠 ganti dengan label runner-mu (misal: self-hosted, macos, personal)
+    timeout-minutes: 43200  # 30 hari (praktis unlimited)
 
     steps:
       - name: Show macOS Info
         run: |
+          echo "=== macOS Info ==="
           sw_vers
           uname -a
 
-      - name: Install Tailscale
+      - name: Install Tailscale (macOS)
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscaled &
+          echo "Downloading latest Tailscale package..."
+          curl -fsSL -o tailscale.pkg https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg
+          sudo installer -pkg tailscale.pkg -target /
+          rm tailscale.pkg
+          echo "✅ Tailscale installed!"
+          /Applications/Tailscale.app/Contents/MacOS/tailscale version
 
-      - name: Connect to Tailscale
+      - name: Start Tailscale Daemon
+        run: |
+          sudo /Applications/Tailscale.app/Contents/MacOS/tailscaled &
+
+      - name: Connect to Tailscale Network
         env:
           TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          sudo tailscale up --authkey=${TS_AUTHKEY} --hostname=macos-gh-${{ github.run_id }}
-          echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+          sleep 3
+          sudo /Applications/Tailscale.app/Contents/MacOS/tailscale up \
+            --authkey=${TS_AUTHKEY} \
+            --hostname=selfhosted-macos-${{ github.run_id }} \
+            --accept-dns=false
+          echo "TAILSCALE_IP=$(/Applications/Tailscale.app/Contents/MacOS/tailscale ip -4)" >> $GITHUB_ENV
+          echo "✅ Connected to Tailscale network!"
 
-      - name: Create Remote User
+      - name: Verify Tailscale
+        run: |
+          echo "🔍 Checking Tailscale status..."
+          /Applications/Tailscale.app/Contents/MacOS/tailscale status
+          echo "Tailscale IP: $TAILSCALE_IP"
+
+      - name: Create GUI User
         run: |
           USERNAME="guiuser"
           PASSWORD=$(openssl rand -base64 12)
@@ -34,34 +54,40 @@ jobs:
           sudo dscl . -append /Groups/admin GroupMembership $USERNAME
           echo "GUI_USER=$USERNAME" >> $GITHUB_ENV
           echo "GUI_PASS=$PASSWORD" >> $GITHUB_ENV
-          echo "Created user: $USERNAME with password: $PASSWORD"
+          echo "Created user: $USERNAME"
+          echo "Password: $PASSWORD"
 
-      - name: Enable Screen Sharing (VNC)
+      - name: Enable VNC Access
         run: |
+          echo "🔧 Enabling Screen Sharing..."
           sudo systemsetup -setremotedesktop on
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCEnabled -bool true
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
             -clientopts -setvncpw -vncpw $GUI_PASS \
             -restart -agent -privs -all
 
           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app
           sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app
+          echo "✅ Screen Sharing enabled (port 5900)"
 
       - name: Display Access Info
         run: |
-          echo "===================================="
-          echo "🍏 macOS GUI Remote Ready!"
-          echo "VNC (Screen Sharing) Info:"
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo "Username: $GUI_USER"
-          echo "Password: $GUI_PASS"
-          echo "Port: 5900"
-          echo "Connect via VNC viewer from Windows:"
-          echo "vnc://$TAILSCALE_IP"
-          echo "===================================="
+          echo "=============================================="
+          echo "🍏 macOS GUI Remote Ready via Tailscale!"
+          echo "🔗 Connect using any VNC viewer:"
+          echo "    Address : $TAILSCALE_IP:5900"
+          echo "    Username: $GUI_USER"
+          echo "    Password: $GUI_PASS"
+          echo "----------------------------------------------"
+          echo "💡 On Windows: use RealVNC / TightVNC"
+          echo "💡 On Linux  : use Remmina / Vinagre"
+          echo "💡 On macOS  : use Finder → Go → Connect to Server → vnc://$TAILSCALE_IP"
+          echo "=============================================="
+          echo "💤 Keeping session active indefinitely..."
           while true; do
             echo "[$(date)] macOS GUI active on $TAILSCALE_IP"
             sleep 300
