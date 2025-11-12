@@ -1,0 +1,68 @@
+name: macOS_GUI_Remote
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-vnc:
+    runs-on: macos-15  # macOS Sequoia
+    timeout-minutes: 360
+
+    steps:
+      - name: Show macOS Info
+        run: |
+          sw_vers
+          uname -a
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscaled &
+
+      - name: Connect to Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          sudo tailscale up --authkey=${TS_AUTHKEY} --hostname=macos-gh-${{ github.run_id }}
+          echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+
+      - name: Create Remote User
+        run: |
+          USERNAME="guiuser"
+          PASSWORD=$(openssl rand -base64 12)
+          sudo sysadminctl -addUser $USERNAME -password $PASSWORD
+          sudo dscl . -append /Groups/admin GroupMembership $USERNAME
+          echo "GUI_USER=$USERNAME" >> $GITHUB_ENV
+          echo "GUI_PASS=$PASSWORD" >> $GITHUB_ENV
+          echo "Created user: $USERNAME with password: $PASSWORD"
+
+      - name: Enable Screen Sharing (VNC)
+        run: |
+          sudo systemsetup -setremotedesktop on
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCEnabled -bool true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw $GUI_PASS \
+            -restart -agent -privs -all
+
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app
+
+      - name: Display Access Info
+        run: |
+          echo "===================================="
+          echo "🍏 macOS GUI Remote Ready!"
+          echo "VNC (Screen Sharing) Info:"
+          echo "Tailscale IP: $TAILSCALE_IP"
+          echo "Username: $GUI_USER"
+          echo "Password: $GUI_PASS"
+          echo "Port: 5900"
+          echo "Connect via VNC viewer from Windows:"
+          echo "vnc://$TAILSCALE_IP"
+          echo "===================================="
+          while true; do
+            echo "[$(date)] macOS GUI active on $TAILSCALE_IP"
+            sleep 300
+          done
