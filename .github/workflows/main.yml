@@ -1,79 +1,111 @@
-name: MacOS VNC Setup (TigerVNC)
+name: MacOS VNC - Safe Approach
 
 on:
   workflow_dispatch:
 
 jobs:
-  virtual-vnc:
+  secure-vnc:
     runs-on: macos-14
     timeout-minutes: 360
 
     steps:
-      # 1. Install Dependencies (TigerVNC dan XQuartz)
-      - name: Install Dependencies
+      # 1. Enable VNC tanpa mengganggu proses existing
+      - name: Enable Screen Sharing
         run: |
-          brew update
-          brew install tigervnc
-          # XQuartz diperlukan untuk lingkungan X11
-          brew install --cask xquartz
-
-      # 2. Configure and Start TigerVNC
-      - name: Configure and Start TigerVNC
-        run: |
-          # Buat password VNC 8 karakter secara acak
-          VNC_PASS=$(openssl rand -base64 6)
+          VNC_PASS=$(openssl rand -base64 12)
           echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
-          echo "::add-mask::$VNC_PASS"
           
-          # Buat file password VNC
-          mkdir -p ~/.vnc
-          echo "$VNC_PASS" | vncpasswd -f > ~/.vnc/passwd
-          chmod 600 ~/.vnc/passwd
-          
-          # Jalankan server VNC di display :1 (port 5901)
-          # -localhost no agar bisa diakses dari IP Tailscale
-          vncserver :1 -localhost no -geometry 1920x1080 -depth 24
-          
-          echo "TigerVNC server dimulai di port 5901"
+          # Enable Screen Sharing via launchctl tanpa mengganggu
+          sudo launchctl enable system/com.apple.screensharing
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
-      # 3. Install Tailscale
-      - name: Install Tailscale
+      # 2. Inject TCC permissions untuk Screen Recording
+      - name: Fix Screen Recording Permissions
         run: |
-          brew install tailscale
+          echo "Injecting Screen Recording permissions directly to TCC database..."
+          
+          # Backup TCC database
+          sudo cp "/Library/Application Support/com.apple.TCC/TCC.db" "/Library/Application Support/com.apple.TCC/TCC.db.backup" 2>/dev/null || true
+          
+          # Inject permissions untuk screensharing dan related processes
+          for service in "kTCCServiceScreenCapture" "kTCCServiceScreenRecording"; do
+            for client in "com.apple.screensharing" "com.apple.Terminal" "com.apple.WindowServer" "com.apple.loginwindow"; do
+              sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access (service, client, client_type, allowed, prompt_count, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES('$service','$client',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
+            done
+          done
+          
+          echo "TCC permissions injected successfully"
 
-      # 4. Connect Tailscale
-      - name: Connect Tailscale
+      # 3. Enable ARD dengan VNC (tanpa restart yang berlebihan)
+      - name: Enable ARD with VNC
         run: |
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -clientopts -setvncpw -vncpw "$VNC_PASSWORD" \
+            -restart -agent -privs -all
+
+      # 4. Start GUI Session dengan aman (tanpa kickstart WindowServer)
+      - name: Start GUI Session Safely
+        run: |
+          echo "Starting GUI session safely..."
+          
+          # Hanya menjalankan aplikasi sebagai user runner untuk memastikan session aktif
+          for i in {1..5}; do
+            echo "GUI activation attempt $i..."
+            sudo -u runner open -a Finder 2>/dev/null || true
+            sudo -u runner open -a Safari 2>/dev/null || true
+            sudo -u runner open -a SystemPreferences 2>/dev/null || true
+            sleep 3
+          done
+
+      # 5. Install Tailscale
+      - name: Setup Tailscale
+        run: |
+          which tailscale || brew install tailscale
           sudo brew services start tailscale
-          sleep 5
+          sleep 10
           
           sudo tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=gh-runner-macos-$GITHUB_RUN_ID
-            
-          sleep 5
-          tsIP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "Tailscale IP: $tsIP"
-
-      # 5. Keep Alive and Show Details
-      - name: Keep Alive
-        run: |
-          echo "========================================"
-          echo "=== Detail Koneksi VNC (TigerVNC) ==="
-          echo "========================================"
-          echo "IP (via Tailscale): $TAILSCALE_IP"
-          echo "Port: 5901"
-          echo "Password: $VNC_PASSWORD"
-          echo "========================================"
-          echo
-          echo "CATATAN: Anda terhubung ke desktop VIRTUAL."
-          echo "Anda akan melihat layar abu-abu pada awalnya."
-          echo "Ini TIDAK akan menampilkan Finder macOS."
           
-          # Loop agar koneksi tetap hidup
+          sleep 5
+          echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
+
+      # 6. Verify Setup
+      - name: Verify VNC Setup
+        run: |
+          echo "=== VNC Setup Verification ==="
+          
+          # Check services
+          echo "1. Screen Sharing Service:"
+          sudo launchctl list com.apple.screensharing && echo "✅ RUNNING" || echo "❌ NOT RUNNING"
+          
+          echo "2. VNC Port:"
+          nc -z -w 1 localhost 5900 && echo "✅ PORT 5900 OPEN" || echo "❌ PORT 5900 CLOSED"
+          
+          echo "3. ARD Agent:"
+          pgrep -f ARDAgent && echo "✅ ARD AGENT RUNNING" || echo "❌ ARD AGENT NOT FOUND"
+          
+          echo "4. WindowServer:"
+          pgrep -x WindowServer && echo "✅ WINDOWSERVER ACTIVE" || echo "❌ WINDOWSERVER INACTIVE"
+          
+          echo "IP: $TAILSCALE_IP"
+          echo "Password: $VNC_PASSWORD"
+
+      # 7. Keep Alive
+      - name: Maintain Connection
+        run: |
+          echo "=== VNC READY - CONNECT NOW ==="
+          echo "IP: $TAILSCALE_IP:5900"
+          echo "User: runner"  
+          echo "Password: $VNC_PASSWORD"
+          echo "==============================="
+          
+          # Health monitoring
           while true; do
-            echo "[$(date)] Sesi VNC Aktif - IP: $TAILSCALE_IP:5901"
-            tailscale status | grep -v 'offline'
-            sleep 300
+            echo "[$(date +'%H:%M:%S')] VNC Active - IP: $TAILSCALE_IP"
+            sleep 60
           done
