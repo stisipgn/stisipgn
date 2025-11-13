@@ -1,195 +1,116 @@
-name: VNC_Linux_Tailscale_Full
+name: Remote Desktop + Tailscale (Linux)
 
 on:
   workflow_dispatch:
 
 jobs:
-  vnc-tailscale:
+  remote-desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 2400
-
-    env:
-      # display number we will use
-      VNC_DISPLAY: ":1"
-      VNC_PORT: 5901
-
+    timeout-minutes: 360 # adjust as needed; keep job running while you remote in
     steps:
-      - name: 🧩 System Info
-        run: |
-          echo "=== Linux environment ==="
-          lsb_release -a || cat /etc/os-release
-          uname -a
-          echo "========================="
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
 
-      - name: 📦 Install XFCE, TigerVNC, dependencies
+      - name: Make setup script executable
         run: |
+          mkdir -p tools
+          cat > tools/setup-remote-tail.sh <<'EOF'
+          #!/usr/bin/env bash
           set -euo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies dbus-x11 x11-xserver-utils xauth xfonts-base \
-            tigervnc-standalone-server tigervnc-common curl ca-certificates
-          echo "✅ XFCE & TigerVNC installed"
+          
+          # --- variables
+          DISPLAY_NUM=":1"
+          SCREEN_RES="1280x800x24"
+          TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
+          HOSTNAME="${HOSTNAME:-gh-runner}"
+          TMUX_SESSION="remote_desktop"
+          LOG_DIR="$HOME/remote_logs"
+          mkdir -p "$LOG_DIR"
 
-      - name: 👤 Create remote user and set strong password
-        run: |
-          set -euo pipefail
-          sudo useradd -m -s /bin/bash remoteuser || true
-          PW=$(tr -dc 'A-Za-z0-9!@#$%^-+=' </dev/urandom | head -c 12 || true)
-          # ensure password was generated
-          if [ -z "$PW" ]; then
-            PW="VncTempPwd123!"
-          fi
-          echo "remoteuser:$PW" | sudo chpasswd
-          sudo usermod -aG sudo remoteuser || true
-          echo "VNC_PASS=$PW" >> $GITHUB_ENV
-          echo "Created remoteuser (password saved to \$GITHUB_ENV)"
+          # Update & install required packages
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal xfce4-session \
+            x11vnc xvfb xauth dbus-x11 git wget curl tmux ca-certificates
 
-      - name: 🧠 Prepare user VNC environment (fixed HOME)
-        run: |
-          set -euo pipefail
-          RU_HOME=/home/remoteuser
-          sudo -u remoteuser mkdir -p $RU_HOME/.vnc
-          # ensure .Xresources exists to avoid xrdb errors
-          sudo -u remoteuser touch $RU_HOME/.Xresources
-          sudo chown remoteuser:remoteuser $RU_HOME/.Xresources
-
-          # xstartup: explicit HOME and absolute paths to avoid /home/runner mixup
-          cat <<'XSTART' | sudo -u remoteuser tee $RU_HOME/.vnc/xstartup >/dev/null
-#!/bin/bash
-export HOME=/home/remoteuser
-# load X resources if present (no failure if not)
-xrdb /home/remoteuser/.Xresources || true
-# start xfce session
-startxfce4 &
-XSTART
-
-          sudo chmod +x $RU_HOME/.vnc/xstartup
-          sudo chown remoteuser:remoteuser -R $RU_HOME/.vnc
-          echo "✅ xstartup written and permissions set"
-
-      - name: 🔐 Set VNC password (secure, noninteractive)
-        run: |
-          set -euo pipefail
-          RU_HOME=/home/remoteuser
-          # create vnc password file using vncpasswd -f (reads password from stdin)
-          sudo -u remoteuser bash -c "printf '%s\n' \"$VNC_PASS\" | vncpasswd -f > $RU_HOME/.vnc/passwd"
-          sudo chmod 600 $RU_HOME/.vnc/passwd
-          sudo chown remoteuser:remoteuser $RU_HOME/.vnc/passwd
-          echo "✅ VNC password configured"
-
-      - name: 🚀 Start (restart) TigerVNC server (display :1)
-        run: |
-          set -euo pipefail
-          RU_HOME=/home/remoteuser
-
-          # kill existing display if any (ignore non-zero)
-          sudo -u remoteuser env HOME=$RU_HOME vncserver -kill $VNC_DISPLAY >/dev/null 2>&1 || true
-
-          # start a fresh VNC server as remoteuser with proper HOME
-          sudo -u remoteuser env HOME=$RU_HOME vncserver $VNC_DISPLAY -geometry 1280x720 -depth 24
-
-          sleep 2
-          # show server log tail for debugging
-          LOG=$(ls -1 $RU_HOME/.vnc/*${VNC_DISPLAY#:}.log 2>/dev/null | tail -n1 || true)
-          if [ -n "$LOG" ]; then
-            echo "=== VNC Server Log ($LOG) ==="
-            tail -n +1 "$LOG" || true
-            echo "=== end log ==="
+          # Start Xvfb on :1
+          if ! pgrep -f "Xvfb :1" > /dev/null; then
+            nohup Xvfb ${DISPLAY_NUM} -screen 0 ${SCREEN_RES} > "$LOG_DIR/xvfb.log" 2>&1 &
+            sleep 1
           fi
 
-          # quick check: list processes
-          ps aux | grep Xtigervnc | grep -v grep || true
-          echo "✅ VNC server started on display $VNC_DISPLAY (port $VNC_PORT)"
+          export DISPLAY=${DISPLAY_NUM}
+          export XAUTHORITY="$HOME/.Xauthority"
 
-      - name: 🟦 Install Tailscale (and up)
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${TS_AUTHKEY:-}" ]; then
-            echo "❌ secret TAILSCALE_AUTHKEY is missing"
-            exit 1
+          # Start dbus (some DE need it)
+          if ! pgrep -f "dbus-daemon --session" > /dev/null; then
+            dbus-launch --exit-with-session >/dev/null 2>&1 || true
           fi
 
-          # install tailscale (official installer)
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-
-          # bring up tailscale with authkey; set hostname using run id
-          sudo tailscale up --authkey="${TS_AUTHKEY}" --hostname="gh-vnc-${{ github.run_id }}" --accept-routes=false || true
-
-          # wait for an IPv4 Tailscale address
-          TS_IP=""
-          for i in $(seq 1 12); do
+          # Start a lightweight XFCE session in background if not running
+          if ! pgrep -f "xfce4-session" > /dev/null; then
+            nohup bash -lc "startxfce4 >/dev/null 2>&1" &
             sleep 2
-            TS_IP=$(tailscale ip -4 2>/dev/null || true)
-            # tailscale ip sometimes prints multiple; pick first 100.* address if present, else first non-empty IPv4
-            if [ -n "$TS_IP" ]; then
-              # prefer 100.* (Tailscale default)
-              PREFF=$(echo "$TS_IP" | tr ' ' '\n' | grep -m1 '^100\.' || true)
-              if [ -n "$PREFF" ]; then
-                TS_IP=$PREFF
-              else
-                TS_IP=$(echo "$TS_IP" | tr ' ' '\n' | head -n1)
-              fi
-              break
-            fi
-          done
-
-          if [ -z "$TS_IP" ]; then
-            echo "❌ Failed to obtain Tailscale IP after retries"
-            tailscale status || true
-            exit 1
           fi
 
-          echo "TS_IP=$TS_IP" >> $GITHUB_ENV
-          echo "✅ Tailscale up. IP: $TS_IP"
+          # Install Tailscale
+          if ! command -v tailscale >/dev/null; then
+            curl -fsSL https://tailscale.com/install.sh | sh
+          fi
 
-      - name: 🔎 Verify connectivity to VNC port via Tailscale
+          # Start tailscaled and bring interface up with authkey (must be provided)
+          sudo tailscaled --tun=userspace-networking > "$LOG_DIR/tailscaled.log" 2>&1 &
+          sleep 2
+
+          if [ -z "$TAILSCALE_AUTHKEY" ]; then
+            echo "ERROR: TAILSCALE_AUTHKEY not set. Set secret TAILSCALE_AUTHKEY in GitHub Actions." >&2
+            exit 2
+          fi
+
+          # bring tailscale up
+          sudo tailscale up --authkey="${TAILSCALE_AUTHKEY}" --accept-routes=false --hostname="${HOSTNAME}" --tun=userspace-networking > "$LOG_DIR/tailscale_up.log" 2>&1 || true
+          sleep 2
+
+          # Start x11vnc (no password by default — recommended to set a password or restrict via tailscale)
+          if ! pgrep -f "x11vnc -display" > /dev/null; then
+            nohup x11vnc -display ${DISPLAY} -forever -shared -noxrecord -noxfixes -noxdamage -bg -o "$LOG_DIR/x11vnc.log" >/dev/null 2>&1 || true
+            sleep 1
+          fi
+
+          # Optionally, set a VNC password (uncomment and set)
+          # mkdir -p $HOME/.vnc
+          # printf "yourpassword\nyourpassword\n" | vncpasswd $HOME/.vnc/passwd
+          # chmod 600 $HOME/.vnc/passwd
+          # start x11vnc with -rfbauth $HOME/.vnc/passwd
+
+          # Print status and Tailscale IP
+          echo "=== Processes ==="
+          ps aux | egrep "Xvfb|xfce4-session|x11vnc|tailscaled|tailscale" || true
+          echo
+          echo "=== Tailscale status (may require a moment to appear) ==="
+          sudo tailscale status --json || sudo tailscale status || true
+          echo
+          echo "=== Get Tailscale IPs ==="
+          sudo tailscale ip -4 || true
+          sudo tailscale ip -6 || true
+          echo
+          echo "If tailscale up succeeded, connect your VNC client to <TAILSCALE_IP>:5900"
+          EOF
+
+          chmod +x tools/setup-remote-tail.sh
+
+      - name: Run setup script (starts X, XFCE, x11vnc, tailscale)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          HOSTNAME: gh-runner-remote
         run: |
-          set -euo pipefail
-          if [ -z "${TS_IP:-}" ]; then
-            echo "❌ TS_IP not set"
-            exit 1
-          fi
-          # use nc (install if missing)
-          if ! command -v nc >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y netcat
-          fi
+          # keep job alive and run in tmux so log remains accessible
+          ./tools/setup-remote-tail.sh | tee setup.log
 
-          # test TCP connect (timeout 3s)
-          if nc -z -w 3 "$TS_IP" $VNC_PORT; then
-            echo "✅ TCP $TS_IP:$VNC_PORT reachable"
-          else
-            echo "⚠ TCP $TS_IP:$VNC_PORT NOT reachable (it may still come up). Dumping VNC log:"
-            tail -n 200 /home/remoteuser/.vnc/*${VNC_DISPLAY#:}.log || true
-            # don't fail immediately: give a warning but continue, user can check logs
-          fi
-
-      - name: 📋 Connection Info (printed cleanly)
+      - name: Show quick connection hints
         run: |
-          echo "==========================================="
-          echo "Linux TigerVNC + Tailscale ready"
-          echo "Tailscale IP  : $TS_IP"
-          echo "VNC Address   : ${TS_IP}:$VNC_PORT"
-          echo "VNC Display   : $VNC_DISPLAY"
-          echo "Username      : remoteuser"
-          echo "Password      : $VNC_PASS"
-          echo "To connect    : from a machine on your Tailnet, open a VNC viewer and connect to ${TS_IP}:$VNC_PORT"
-          echo "==========================================="
-
-      - name: 💤 Keep Runner Alive (tail logs & heartbeat)
-        run: |
-          set -euo pipefail
-          LOGFILE=$(ls -1 /home/remoteuser/.vnc/*${VNC_DISPLAY#:}.log 2>/dev/null | tail -n1 || true)
-          echo "Tailing VNC log: $LOGFILE"
-          while true; do
-            echo "[$(date)] heartbeat - VNC running?"
-            if [ -n "$LOGFILE" ]; then
-              tail -n 50 "$LOGFILE" || true
-            fi
-            # Show a short tailscale status for convenience
-            tailscale status --json 2>/dev/null || tailscale status 2>/dev/null || true
-            sleep 300
-          done
+          echo "---- tail status ----"
+          sudo tailscale status || true
+          echo "---- tailscale ip -----"
+          sudo tailscale ip -4 || true
+          echo "Connect VNC client to <tailscale-ip>:5900 (VNC protocol)."
