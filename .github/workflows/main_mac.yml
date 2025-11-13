@@ -5,14 +5,12 @@ on:
 
 jobs:
   secure-vnc:
-    runs-on: macos-14
+    runs-on: macos-16
     timeout-minutes: 360
 
     steps:
 
-      # ---------------------------------------------------------
-      # 1. Enable VNC + Password
-      # ---------------------------------------------------------
+      # 1. Enable VNC
       - name: Generate Password and Enable VNC
         run: |
           VNC_PASS=$(openssl rand -base64 12)
@@ -29,104 +27,75 @@ jobs:
             -privs -all -users runner
 
 
-      # ---------------------------------------------------------
-      # 2. FIX BLACK SCREEN — Force GUI Login
-      # ---------------------------------------------------------
-      - name: Force GUI Login Session (Fix Black Screen)
+      # 2. FIX BLACK SCREEN (AMAN): Force GUI by opening apps
+      - name: Start GUI Desktop Environment (Safe Mode)
         run: |
-          USER_ID=$(id -u runner)
-          echo "Forcing GUI session for runner... UID=$USER_ID"
+          echo "Starting macOS GUI apps to activate WindowServer..."
 
-          # Restart GUI session tree
-          sudo launchctl bootout gui/$USER_ID || true
+          sudo -u runner open -a Finder || true
+          sudo -u runner open -a Safari || true
+          sudo -u runner open -a TextEdit || true
+          sudo -u runner open -a Terminal || true
 
-          # Load Dock + Finder
-          sudo launchctl bootstrap gui/$USER_ID /System/Library/LaunchAgents/com.apple.Dock.plist
-          sudo launchctl bootstrap gui/$USER_ID /System/Library/LaunchAgents/com.apple.Finder.plist
-
-          # Launch apps to force GUI desktop online
-          launchctl asuser $USER_ID open -a Finder
-          launchctl asuser $USER_ID open -a "System Settings"
-          launchctl asuser $USER_ID open -a Terminal
-          launchctl asuser $USER_ID open -a Safari
-
-          echo "Waiting for GUI to start..."
-          sleep 10
+          echo "Waiting for GUI to initialize..."
+          sleep 8
 
 
-      # ---------------------------------------------------------
-      # 3. FIX BLACK SCREEN — Enable Screen Recording & Capture
-      # ---------------------------------------------------------
-      - name: Enable ScreenCapture & ScreenRecording Permissions
+      # 3. Reset screen capture permissions
+      - name: Reset Screen Permissions
         run: |
           sudo tccutil reset ScreenCapture || true
           sudo tccutil reset ScreenRecording || true
           sudo tccutil reset Accessibility || true
 
-          USER_ID=$(id -u runner)
-          launchctl asuser $USER_ID open -a Finder
-          sleep 5
+          sudo -u runner open -a Finder || true
+          sleep 4
 
 
-      # ---------------------------------------------------------
-      # 4. Install Tailscale via Homebrew
-      # ---------------------------------------------------------
+      # 4. Install Tailscale
       - name: Install Tailscale via Homebrew
         run: brew install tailscale
 
 
-      # ---------------------------------------------------------
       # 5. Connect Tailscale
-      # ---------------------------------------------------------
       - name: Establish Tailscale Connection
         run: |
           TS_BIN=$(which tailscale)
           echo "Tailscale binary: $TS_BIN"
 
-          echo "Starting Tailscale daemon..."
           sudo brew services start tailscale
-          sleep 5
+          sleep 4
 
-          echo "Running tailscale up..."
           sudo $TS_BIN up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=gh-runner-macos-$GITHUB_RUN_ID
 
-          echo "Waiting for Tailscale IP..."
-          sleep 5
+          sleep 4
 
           tsIP="$($TS_BIN ip -4)"
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
           echo "Tailscale IP: $tsIP"
 
 
-      # ---------------------------------------------------------
-      # 6. Verify VNC Port
-      # ---------------------------------------------------------
-      - name: Verify VNC Accessibility
-        run: |
-          echo "Testing port 5900 on $TAILSCALE_IP..."
-          nc -z -v $TAILSCALE_IP 5900
+      # 6. Test port VNC
+      - name: Verify VNC
+        run: nc -z -v $TAILSCALE_IP 5900
 
 
-      # ---------------------------------------------------------
-      # 7. Keep Runner Alive for Remote VNC
-      # ---------------------------------------------------------
+      # 7. Keep connection open
       - name: Maintain Connection
         run: |
           TS_BIN=$(which tailscale)
 
-          echo ""
-          echo "==== VNC ACCESS ===="
+          echo "===== VNC ACCESS ====="
           echo "IP: $TAILSCALE_IP"
           echo "Port: 5900"
           echo "User: runner"
           echo "Password: $VNC_PASSWORD"
           echo "======================"
-          echo ""
 
           while true; do
-            echo "[$(date)] VNC Aktif..."
+            echo "[$(date)] VNC running..."
             $TS_BIN status
             sleep 300
           done
