@@ -1,83 +1,101 @@
-name: macOS_GUI_Remote_Cloud
+name: xxx
 
 on:
   workflow_dispatch:
 
 jobs:
-  macos-vnc:
-    runs-on: macos-15-arm64
-    timeout-minutes: 2000
+  secure-vnc:
+    runs-on: macos-14
+    timeout-minutes: 360
 
     steps:
-      - name: Show macOS Info
-        run: |
-          echo "=== macOS Info ==="
-          sw_vers
-          uname -a
 
-      - name: Install Tailscale
+      # 1. Enable VNC
+      - name: Generate Password and Enable VNC
         run: |
-          echo "📦 Installing Tailscale..."
-          curl -fsSL -o tailscale.pkg https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg
-          sudo installer -pkg tailscale.pkg -target /
-          rm tailscale.pkg
-          echo "✅ Tailscale installed!"
-          sudo /Applications/Tailscale.app/Contents/MacOS/tailscaled &
+          VNC_PASS=$(openssl rand -base64 12)
+          echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
+          echo "Password VNC: $VNC_PASS"
 
-      - name: Connect to Tailscale
-        env:
-          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          sleep 5
-          echo "🔗 Connecting to Tailscale network..."
-          sudo /Applications/Tailscale.app/Contents/MacOS/tailscale up \
-            --authkey=${TS_AUTHKEY} \
-            --hostname=macos-gh-${{ github.run_id }} \
-            --accept-dns=false
-          echo "TAILSCALE_IP=$(/Applications/Tailscale.app/Contents/MacOS/tailscale ip -4)" >> $GITHUB_ENV
-          echo "✅ Connected to Tailscale network!"
-
-      - name: Enable VNC Access
-        run: |
-          echo "🔧 Enabling Screen Sharing..."
-          PASSWORD=$(openssl rand -base64 8)
-          sudo sysadminctl -addUser vncuser -password $PASSWORD
-          sudo dscl . -append /Groups/admin GroupMembership vncuser
-          echo "VNC_USER=vncuser" >> $GITHUB_ENV
-          echo "VNC_PASS=$PASSWORD" >> $GITHUB_ENV
-
-          sudo systemsetup -setremotedesktop on
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on \
+            -activate \
+            -configure \
+            -access -on \
             -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw $PASSWORD \
-            -restart -agent -privs -all
+            -clientopts -setvncpw -vncpw "$VNC_PASS" \
+            -restart -agent \
+            -privs -all -users runner
 
-          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on
-          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /System/Library/CoreServices/RemoteManagement/ARDAgent.app
-          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp /System/Library/CoreServices/RemoteManagement/ARDAgent.app
 
-          echo "✅ Screen Sharing enabled (port 5900)"
-
-      - name: Show Connection Info
+      # 2. FIX BLACK SCREEN (AMAN): Force GUI by opening apps
+      - name: Start GUI Desktop Environment (Safe Mode)
         run: |
-          echo "====================================="
-          echo "🍏 macOS GUI Remote is READY!"
-          echo "🔗 Connect using your VNC client:"
-          echo "    Address : $TAILSCALE_IP:5900"
-          echo "    Username: $VNC_USER"
-          echo "    Password: $VNC_PASS"
-          echo "====================================="
-          echo "💡 Tips:"
-          echo "   • On Windows: use RealVNC / TightVNC"
-          echo "   • On Linux : use Remmina / Vinagre"
-          echo "   • On macOS : Finder → Go → Connect to Server → vnc://$TAILSCALE_IP"
-          echo "====================================="
+          echo "Starting macOS GUI apps to activate WindowServer..."
 
-      - name: Keep Alive
+          sudo -u runner open -a Finder || true
+          sudo -u runner open -a Safari || true
+          sudo -u runner open -a TextEdit || true
+          sudo -u runner open -a Terminal || true
+
+          echo "Waiting for GUI to initialize..."
+          sleep 8
+
+
+      # 3. Reset screen capture permissions
+      - name: Reset Screen Permissions
         run: |
-          echo "💤 Keeping session alive for up to 2000 minutes..."
-          for i in {1..400}; do
-            echo "[$(date)] macOS GUI active at $TAILSCALE_IP (iteration $i/400)"
+          sudo tccutil reset ScreenCapture || true
+          sudo tccutil reset ScreenRecording || true
+          sudo tccutil reset Accessibility || true
+
+          sudo -u runner open -a Finder || true
+          sleep 4
+
+
+      # 4. Install Tailscale
+      - name: Install Tailscale via Homebrew
+        run: brew install tailscale
+
+
+      # 5. Connect Tailscale
+      - name: Establish Tailscale Connection
+        run: |
+          TS_BIN=$(which tailscale)
+          echo "Tailscale binary: $TS_BIN"
+
+          sudo brew services start tailscale
+          sleep 4
+
+          sudo $TS_BIN up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-macos-$GITHUB_RUN_ID
+
+          sleep 4
+
+          tsIP="$($TS_BIN ip -4)"
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "Tailscale IP: $tsIP"
+
+
+      # 6. Test port VNC
+      - name: Verify VNC
+        run: nc -z -v $TAILSCALE_IP 5900
+
+
+      # 7. Keep connection open
+      - name: Maintain Connection
+        run: |
+          TS_BIN=$(which tailscale)
+
+          echo "===== VNC ACCESS ====="
+          echo "IP: $TAILSCALE_IP"
+          echo "Port: 5900"
+          echo "User: runner"
+          echo "Password: $VNC_PASSWORD"
+          echo "======================"
+
+          while true; do
+            echo "[$(date)] VNC running..."
+            $TS_BIN status
             sleep 300
           done
