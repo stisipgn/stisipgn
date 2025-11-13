@@ -1,136 +1,60 @@
-name: MacOS VNC Setup
+name: macOS Headless VNC
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-vnc:
-    runs-on: macos-14  # atau macos-latest
-    timeout-minutes: 360
+  vnc:
+    runs-on: macos-14
 
     steps:
-      # 1. Enable VNC dengan konfigurasi yang lebih komprehensif
-      - name: Enable VNC Service
+      - name: Install XQuartz
         run: |
-          VNC_PASS=$(openssl rand -base64 12)
-          echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
-          
-          # Enable Remote Management dengan VNC
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate \
-            -configure -access -on \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "$VNC_PASS" \
-            -restart -agent \
-            -privs -all
+          curl -L -o XQuartz.pkg https://github.com/XQuartz/XQuartz/releases/download/XQuartz-2.8.5/XQuartz-2.8.5.pkg
+          sudo installer -pkg XQuartz.pkg -target /
 
-      # 2. Setup GUI Environment
-      - name: Setup GUI Environment
+      - name: Install TigerVNC
         run: |
-          # Enable auto-login untuk user runner
-          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "runner"
-          
-          # Disable screen saver dan sleep
-          sudo -u runner defaults -currentHost write com.apple.screensaver idleTime 0
-          sudo systemsetup -setdisplaysleep Never -setcomputersleep Never -setharddisksleep Never
+          brew install tigervnc
+          echo "Pilih password random"
+          PASS=$(openssl rand -base64 12)
+          echo "$PASS" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+          echo "VNC_PASS=$PASS" >> $GITHUB_ENV
 
-          # Launch GUI Services
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.windowserver.plist 2>/dev/null || true
-
-      # 3. Start GUI Session
-      - name: Start GUI Session
+      - name: Start Fake X11 Desktop (Xvnc)
         run: |
-          # Kill existing processes yang mungkin hang
-          sudo pkill -f "WindowServer" || true
-          sudo pkill -f "loginwindow" || true
-          
-          # Start loginwindow process
-          sudo launchctl load /System/Library/LaunchDaemons/com.apple.loginwindow.plist
-          
-          # Tunggu GUI ready
-          sleep 10
-          
-          # Launch essential GUI components
-          sudo -u runner launchctl load /System/Library/LaunchAgents/com.apple.Finder.plist 2>/dev/null || true
-          
-          # Force launch Finder
-          sudo -u runner osascript -e 'tell application "Finder" to activate' 2>/dev/null || true
-          
-          echo "Waiting for GUI to initialize..."
-          sleep 15
+          mkdir -p ~/.vnc
+          cat <<EOF > ~/.vnc/xstartup
+#!/bin/sh
+export PATH=/opt/X11/bin:$PATH
+xrdb $HOME/.Xresources
+xclock &
+xterm &
+EOF
+          chmod +x ~/.vnc/xstartup
 
-      # 4. Reset permissions dengan approach yang lebih baik
-      - name: Reset Privacy Permissions
-        run: |
-          # Reset permissions untuk user runner
-          sudo tccutil reset All runner
-          sudo tccutil reset ScreenCapture
-          sudo tccutil reset ScreenRecording
-          sudo tccutil reset Accessibility
-          
-          # Grant permissions ke essential apps
-          SQL="INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.Terminal',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,1541440109);"
-          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "$SQL" 2>/dev/null || true
+          echo "Start VNC server..."
+          /opt/homebrew/bin/Xvnc :0 -geometry 1440x900 -localhost no \
+              -rfbauth ~/.vnc/passwd \
+              -pn -listen tcp &
 
-      # 5. Install Tailscale
+          sleep 3
+          echo "VNC server started"
+
       - name: Install Tailscale
         run: |
-          brew update
           brew install tailscale
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=macos-vnc-$GITHUB_RUN_ID
 
-      # 6. Connect Tailscale
-      - name: Connect Tailscale
-        run: |
-          sudo brew services start tailscale
-          sleep 5
-          
-          sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=gh-runner-macos-$GITHUB_RUN_ID
-            
-          sleep 5
-          tsIP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
 
-      # 7. Verify VNC Connection
-      - name: Verify VNC Service
-        run: |
-          # Check VNC status
-          sudo netstat -an | grep 5900 || echo "Checking VNC port..."
-          
-          # Alternative check
-          sudo launchctl list | grep -i vnc || echo "Checking VNC service..."
-          
-          # Test connection
-          nc -z -v localhost 5900 && echo "VNC is running" || echo "VNC check failed"
-
-      # 8. Final GUI Preparation
-      - name: Final GUI Setup
-        run: |
-          # Ensure user permissions
-          sudo dscl . -create /Users/runner PrimaryGroupID 80
-          
-          # Final GUI apps launch
-          sudo -u runner open -a Finder 2>/dev/null || true
-          sudo -u runner open -a SystemPreferences 2>/dev/null || true
-          
-          # Set resolution (optional)
-          sudo system_profiler SPDisplaysDataType | head -20 || true
-
-      # 9. Maintain Connection
       - name: Keep Alive
         run: |
-          echo "=== VNC Connection Details ==="
+          echo "===== CONNECT WITH VNC ====="
           echo "IP: $TAILSCALE_IP"
-          echo "Port: 5900"
-          echo "User: runner"
-          echo "Password: $VNC_PASSWORD"
-          echo "=============================="
-          
-          # Keep-alive loop
-          while true; do
-            echo "[$(date)] VNC Session Active - IP: $TAILSCALE_IP"
-            tailscale status
-            sleep 60
-          done
+          echo "PORT: 5900"
+          echo "Password: $VNC_PASS"
+          echo "============================"
+          while true; do sleep 60; done
