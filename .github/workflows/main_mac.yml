@@ -5,19 +5,20 @@ on:
 
 jobs:
   secure-vnc:
-    # PERUBAHAN UTAMA: Gunakan macos-13 (Ventura)
-    # Ini untuk menghindari masalah izin "Screen Recording" di macos-14
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 360
 
     steps:
-      # Langkah 1: Siapkan VNC dan Password
+
+      # ---------------------------------------------------------
+      # 1. Enable VNC + Password
+      # ---------------------------------------------------------
       - name: Generate Password and Enable VNC
         run: |
           VNC_PASS=$(openssl rand -base64 12)
           echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
-          echo "Password VNC (akan muncul di log): $VNC_PASS"
-          
+          echo "Password VNC: $VNC_PASS"
+
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate \
             -configure \
@@ -27,76 +28,105 @@ jobs:
             -restart -agent \
             -privs -all -users runner
 
-      # Langkah 2: Install Tailscale via Homebrew
+
+      # ---------------------------------------------------------
+      # 2. FIX BLACK SCREEN — Force GUI Login
+      # ---------------------------------------------------------
+      - name: Force GUI Login Session (Fix Black Screen)
+        run: |
+          USER_ID=$(id -u runner)
+          echo "Forcing GUI session for runner... UID=$USER_ID"
+
+          # Restart GUI session tree
+          sudo launchctl bootout gui/$USER_ID || true
+
+          # Load Dock + Finder
+          sudo launchctl bootstrap gui/$USER_ID /System/Library/LaunchAgents/com.apple.Dock.plist
+          sudo launchctl bootstrap gui/$USER_ID /System/Library/LaunchAgents/com.apple.Finder.plist
+
+          # Launch apps to force GUI desktop online
+          launchctl asuser $USER_ID open -a Finder
+          launchctl asuser $USER_ID open -a "System Settings"
+          launchctl asuser $USER_ID open -a Terminal
+          launchctl asuser $USER_ID open -a Safari
+
+          echo "Waiting for GUI to start..."
+          sleep 10
+
+
+      # ---------------------------------------------------------
+      # 3. FIX BLACK SCREEN — Enable Screen Recording & Capture
+      # ---------------------------------------------------------
+      - name: Enable ScreenCapture & ScreenRecording Permissions
+        run: |
+          sudo tccutil reset ScreenCapture || true
+          sudo tccutil reset ScreenRecording || true
+          sudo tccutil reset Accessibility || true
+
+          USER_ID=$(id -u runner)
+          launchctl asuser $USER_ID open -a Finder
+          sleep 5
+
+
+      # ---------------------------------------------------------
+      # 4. Install Tailscale via Homebrew
+      # ---------------------------------------------------------
       - name: Install Tailscale via Homebrew
         run: brew install tailscale
 
-      # Langkah 3: Start Daemon dan Hubungkan
+
+      # ---------------------------------------------------------
+      # 5. Connect Tailscale
+      # ---------------------------------------------------------
       - name: Establish Tailscale Connection
         run: |
           TS_BIN=$(which tailscale)
-          echo "Tailscale binary found at: $TS_BIN"
-          
-          echo "Starting Tailscale daemon via brew services..."
+          echo "Tailscale binary: $TS_BIN"
+
+          echo "Starting Tailscale daemon..."
           sudo brew services start tailscale
-          
-          echo "Waiting 5 seconds for daemon to initialize..."
           sleep 5
-          
-          echo "Connecting to Tailscale..."
+
+          echo "Running tailscale up..."
           sudo $TS_BIN up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
             --hostname=gh-runner-macos-$GITHUB_RUN_ID
-          
-          echo "Waiting 5 seconds for connection to establish..."
-          sleep 5
-          
-          tsIP=""
-          retries=0
-          while [ -z "$tsIP" ] && [ $retries -lt 10 ]; do
-            echo "Mencari IP Tailscale... (Percobaan $((retries+1)))"
-            tsIP=$($TS_BIN ip -4)
-            sleep 5
-            retries=$((retries + 1))
-          done
-          
-          if [ -z "$tsIP" ]; then
-            echo "::error::Gagal mendapatkan IP Tailscale. Keluar."
-            sudo $TS_BIN status
-            exit 1
-          fi
-          
-          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
-          echo "IP Tailscale berhasil didapat: $tsIP"
 
-      # Langkah 4: Verifikasi Port VNC
+          echo "Waiting for Tailscale IP..."
+          sleep 5
+
+          tsIP="$($TS_BIN ip -4)"
+          echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "Tailscale IP: $tsIP"
+
+
+      # ---------------------------------------------------------
+      # 6. Verify VNC Port
+      # ---------------------------------------------------------
       - name: Verify VNC Accessibility
         run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo "Menguji port VNC 5900 pada $TAILSCALE_IP..."
-          
-          if ! nc -z -v $TAILSCALE_IP 5900; then
-            echo "::warning::Koneksi TCP ke port VNC 5900 gagal"
-          else
-            echo "Konektivitas TCP (VNC) berhasil!"
-          fi
+          echo "Testing port 5900 on $TAILSCALE_IP..."
+          nc -z -v $TAILSCALE_IP 5900
 
-      # Langkah 5: Jaga Koneksi
+
+      # ---------------------------------------------------------
+      # 7. Keep Runner Alive for Remote VNC
+      # ---------------------------------------------------------
       - name: Maintain Connection
         run: |
           TS_BIN=$(which tailscale)
+
           echo ""
-          echo "=== VNC ACCESS ==="
-          echo "http://www.youtube.com/@TipsUNIX"
-          echo "Alamat (Tailscale IP): $TAILSCALE_IP"
+          echo "==== VNC ACCESS ===="
+          echo "IP: $TAILSCALE_IP"
           echo "Port: 5900"
-          echo "Username: runner"
+          echo "User: runner"
           echo "Password: $VNC_PASSWORD"
-          echo "===================="
+          echo "======================"
           echo ""
-          
+
           while true; do
-            echo "[$(date)] VNC Aktif - Gunakan 'Cancel workflow' untuk menghentikan"
-            sudo $TS_BIN status
+            echo "[$(date)] VNC Aktif..."
+            $TS_BIN status
             sleep 300
           done
