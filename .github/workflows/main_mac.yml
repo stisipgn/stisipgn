@@ -1,25 +1,24 @@
-name: VNC_macOS
+name: VNC_TIPSUNIX_macOS
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-vnc:
-    runs-on: macos-latest
-    timeout-minutes: 360 # Batas maks GitHub-hosted runner adalah 360 menit (6 jam)
+    # Menggunakan macos-14 (Sonoma) yang lebih stabil.
+    # Jika Anda benar-benar butuh macos-15 (Sequoia), ganti ini ke macos-15
+    runs-on: macos-14 
+    timeout-minutes: 360
 
     steps:
       - name: Generate Password and Enable VNC
         run: |
-          # Buat password 12 karakter (base64)
           VNC_PASS=$(openssl rand -base64 12)
           echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
           
           echo "Password VNC (akan muncul di log): $VNC_PASS"
           
           # Aktifkan dan konfigurasikan Apple Remote Desktop (VNC)
-          # Perintah ini mengaktifkan agen, mengatur mode VNC legacy (untuk kompatibilitas),
-          # mengatur password VNC, dan memberikan hak akses ke user 'runner'
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate \
             -configure \
@@ -27,32 +26,36 @@ jobs:
             -clientopts -setvnclegacy -vnclegacy yes \
             -clientopts -setvncpw -vncpw "$VNC_PASS" \
             -restart -agent \
-            -privs -all -user runner
+            -privs -all -users runner  # <-- PERBAIKAN: Menggunakan -users (plural)
 
       - name: Install Tailscale
         run: |
-          # Unduh paket macOS yang stabil
           curl -o $RUNNER_TEMP/tailscale.pkg https://pkgs.tailscale.com/stable/Tailscale.pkg
-          
-          # Install paket
           sudo installer -pkg $RUNNER_TEMP/tailscale.pkg -target /
-          
-          # Bersihkan file installer
           rm $RUNNER_TEMP/tailscale.pkg
 
       - name: Establish Tailscale Connection
         run: |
-          # Jalankan Tailscale dengan auth key dan atur hostname yang unik
-          # Executable-nya ada di dalam bundel .app
-          sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up \
+          # Atur Tailscale agar berjalan dalam mode 'unattended' (penting untuk CI)
+          sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale set --unattended
+
+          # PERBAIKAN: Gunakan 'nohup' dan '&' untuk menjalankan di background
+          # Ini mencegah runner membunuh proses (Killed: 9 / Error 137)
+          echo "Menjalankan Tailscale up di background..."
+          nohup sudo /Applications/Tailscale.app/Contents/MacOS/Tailscale up \
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=gh-runner-macos-$GITHUB_RUN_ID
+            --hostname=gh-runner-macos-$GITHUB_RUN_ID &
+          
+          # Beri waktu 10 detik agar Tailscale daemon stabil sebelum polling IP
+          echo "Menunggu 10 detik agar Tailscale terhubung..."
+          sleep 10
           
           # Tunggu Tailscale mendapatkan IP
           tsIP=""
           retries=0
           while [ -z "$tsIP" ] && [ $retries -lt 10 ]; do
-            echo "Menunggu IP Tailscale... (Percobaan $((retries+1)))"
+            echo "Mencari IP Tailscale... (Percobaan $((retries+1)))"
+            # Kita tidak perlu sudo untuk 'ip'
             tsIP=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4)
             sleep 5
             retries=$((retries + 1))
@@ -60,27 +63,33 @@ jobs:
           
           if [ -z "$tsIP" ]; then
             echo "::error::Gagal mendapatkan IP Tailscale. Keluar."
+            # Tampilkan status Tailscale untuk debugging
+            /Applications/Tailscale.app/Contents/MacOS/Tailscale status
             exit 1
           fi
           
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
+          echo "IP Tailscale didapat: $tsIP"
 
       - name: Verify VNC Accessibility
         run: |
           echo "Tailscale IP: $TAILSCALE_IP"
           
           # Tes konektivitas ke port VNC (5900)
-          echo "Menguji port VNC 5900..."
-          if ! nc -z -v $TAILSILL_IP 5900; then
-            echo "::error::Koneksi TCP ke port VNC 5900 gagal"
-            # exit 1 # Kita bisa biarkan ini sebagai peringatan saja
+          echo "Menguji port VNC 5900 pada $TAILSCALE_IP..."
+          
+          # Tambahkan 'nc' (netcat) untuk mengetes port
+          if ! nc -z -v $TAILSCALE_IP 5900; then
+            echo "::warning::Koneksi TCP ke port VNC 5900 gagal"
+          else
+            echo "Konektivitas TCP (VNC) berhasil!"
           fi
-          echo "Konektivitas TCP (VNC) berhasil!"
 
       - name: Maintain Connection
         run: |
           echo ""
           echo "=== VNC ACCESS ==="
+          echo "http://www.youtube.com/@TipsUNIX"
           echo "Alamat (Tailscale IP): $TAILSCALE_IP"
           echo "Port: 5900"
           echo "Username: runner"
@@ -91,5 +100,7 @@ jobs:
           # Jaga agar runner tetap aktif
           while true; do
             echo "[$(date)] VNC Aktif - Gunakan 'Cancel workflow' untuk menghentikan"
+            # Tampilkan status Tailscale setiap 5 menit
+            /Applications/Tailscale.app/Contents/MacOS/Tailscale status
             sleep 300
           done
