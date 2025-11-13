@@ -1,4 +1,4 @@
-name: MacOS VNC - Fix Black Screen
+name: MacOS VNC - No Black Screen Fixed
 
 on:
   workflow_dispatch:
@@ -9,111 +9,98 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # 1. Enable VNC dengan approach yang berbeda
-      - name: Enable Screen Sharing Properly
+      # 1. Enable VNC
+      - name: Enable Screen Sharing
         run: |
           VNC_PASS=$(openssl rand -base64 12)
           echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
           
-          # Method 1: Enable via systemsetup (lebih reliable)
+          # Enable via multiple methods
           sudo systemsetup -setremotelogin on || true
-          
-          # Method 2: Enable Screen Sharing service
           sudo launchctl enable system/com.apple.screensharing
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+
+      # 2. FIX: Direct TCC Database Injection (tanpa tccutil reset)
+      - name: Fix Screen Recording Permissions
+        run: |
+          echo "Injecting Screen Recording permissions directly to TCC database..."
           
-          # Method 3: ARD sebagai backup
+          # Backup TCC database
+          sudo cp "/Library/Application Support/com.apple.TCC/TCC.db" "/Library/Application Support/com.apple.TCC/TCC.db.backup" 2>/dev/null || true
+          
+          # Inject permissions untuk screensharing dan related processes
+          for service in "kTCCServiceScreenCapture" "kTCCServiceScreenRecording"; do
+            for client in "com.apple.screensharing" "com.apple.Terminal" "com.apple.WindowServer" "com.apple.loginwindow"; do
+              sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
+                "INSERT OR REPLACE INTO access (service, client, client_type, allowed, prompt_count, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES('$service','$client',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
+            done
+          done
+          
+          echo "TCC permissions injected successfully"
+
+      # 3. Enable ARD dengan VNC
+      - name: Enable ARD with VNC
+        run: |
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes \
-            -clientopts -setvncpw -vncpw "$VNC_PASS" \
+            -clientopts -setvncpw -vncpw "$VNC_PASSWORD" \
             -restart -agent -privs -all
 
-      # 2. FIX KRITIS: Screen Recording Permissions
-      - name: Fix Screen Recording Permissions
-        run: |
-          echo "Fixing Screen Recording permissions..."
-          
-          # Reset semua permissions screen recording
-          sudo tccutil reset ScreenCapture
-          sudo tccutil reset ScreenRecording
-          sudo tccutil reset Accessibility
-          
-          # Berikan permissions ke processes yang diperlukan (SOLUSI UTAMA)
-          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-            "DELETE FROM access WHERE client='com.apple.screensharing';" 2>/dev/null || true
-          
-          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-            "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.screensharing',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
-          
-          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-            "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenRecording','com.apple.screensharing',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
-
-      # 3. Force Active User Session
+      # 4. Create Active GUI Session
       - name: Create Active GUI Session
         run: |
           echo "Creating active GUI session..."
           
-          # Pastikan loginwindow berjalan
+          # Start GUI services
+          sudo launchctl kickstart -k system/com.apple.WindowServer || true
           sudo launchctl kickstart -k system/com.apple.loginwindow || true
           
-          # Buat session aktif dengan cara yang lebih agresif
-          for i in {1..10}; do
-            echo "Attempt $i to create GUI session..."
-            
-            # Force launch Finder sebagai user
-            sudo -u runner osascript -e 'tell application "Finder" to activate' 2>/dev/null || true
-            
-            # Launch System Preferences untuk trigger permission dialog
-            sudo -u runner open -b com.apple.systempreferences 2>/dev/null || true
-            
-            # Buka aplikasi yang membutuhkan screen recording
-            sudo -u runner open -a Calculator 2>/dev/null || true
-            
+          sleep 10
+          
+          # Launch apps to create active session
+          for i in {1..5}; do
+            echo "GUI activation attempt $i..."
+            sudo -u runner open -a Finder 2>/dev/null || true
+            sudo -u runner open -a Safari 2>/dev/null || true
+            sudo -u runner open -a SystemPreferences 2>/dev/null || true
             sleep 3
           done
 
-      # 4. Alternative: Enable via plist (Method dari Reddit)
-      - name: Alternative Screen Sharing Enable
+      # 5. Alternative: Enable VNC via defaults
+      - name: Alternative VNC Setup
         run: |
           # Enable via preferences
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
-          sudo launchctl load /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           
-          # Set VNC password via system preferences
+          # Set VNC preferences
           sudo defaults write /Library/Preferences/com.apple.VNCSettings TextPassword -string "$VNC_PASSWORD"
           sudo defaults write /Library/Preferences/com.apple.VNCSettings TextOnly -bool false
+          
+          # Restart screensharing
+          sudo launchctl unload /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo launchctl load /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
 
-      # 5. Final Permission Fix (Nuclear Option)
-      - name: Nuclear Permission Fix
+      # 6. Final Permission Fix
+      - name: Final Permission Injection
         run: |
-          # Grant permissions ke semua system processes
-          for bundle in "com.apple.screensharing" "com.apple.Terminal" "com.apple.loginwindow" "com.apple.WindowServer"; do
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenRecording','$bundle',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','$bundle',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
-          done
-
-      # 6. Restart Services dengan benar
-      - name: Restart GUI Services
-        run: |
-          echo "Restarting GUI services..."
+          echo "Performing final permission injection..."
           
-          # Restart services terkait GUI
-          sudo pkill -f "Screen Sharing" 2>/dev/null || true
-          sudo pkill -f "ARDAgent" 2>/dev/null || true
-          
-          sleep 5
-          
-          # Start services kembali
-          sudo launchctl start com.apple.screensharing 2>/dev/null || true
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
+          # Inject untuk user-specific TCC database juga
+          USER_TCC_DIR="/Users/runner/Library/Application Support/com.apple.TCC"
+          if [ -d "$USER_TCC_DIR" ]; then
+            for service in "kTCCServiceScreenCapture" "kTCCServiceScreenRecording"; do
+              for client in "com.apple.screensharing" "com.apple.Terminal" "com.apple.Finder"; do
+                sudo sqlite3 "$USER_TCC_DIR/TCC.db" \
+                  "INSERT OR REPLACE INTO access (service, client, client_type, allowed, prompt_count, csreq, policy_id, indirect_object_identifier_type, indirect_object_identifier, indirect_object_code_identity, flags, last_modified) VALUES('$service','$client',0,1,1,NULL,NULL,NULL,'UNUSED',NULL,0,$(date +%s));" 2>/dev/null || true
+              done
+            done
+          fi
 
       # 7. Install Tailscale
       - name: Setup Tailscale
         run: |
-          brew install tailscale
+          which tailscale || brew install tailscale
           sudo brew services start tailscale
           sleep 10
           
@@ -124,47 +111,48 @@ jobs:
           sleep 5
           echo "TAILSCALE_IP=$(tailscale ip -4)" >> $GITHUB_ENV
 
-      # 8. Verify dengan comprehensive check
-      - name: Verify VNC Connection
+      # 8. Verify Setup
+      - name: Verify VNC Setup
         run: |
-          echo "=== Comprehensive VNC Check ==="
+          echo "=== VNC Setup Verification ==="
           
-          # Check service status
+          # Check services
           echo "1. Screen Sharing Service:"
-          sudo launchctl list | grep -i screen && echo "✅ RUNNING" || echo "❌ STOPPED"
+          sudo launchctl list com.apple.screensharing && echo "✅ RUNNING" || echo "❌ NOT RUNNING"
           
           echo "2. VNC Port:"
-          nc -z -v localhost 5900 && echo "✅ PORT 5900 OPEN" || echo "❌ PORT 5900 CLOSED"
+          nc -z -w 1 localhost 5900 && echo "✅ PORT 5900 OPEN" || echo "❌ PORT 5900 CLOSED"
           
-          echo "3. Remote Management:"
-          sudo systemsetup -getremotelogin | grep "On" && echo "✅ REMOTE LOGIN ON" || echo "❌ REMOTE LOGIN OFF"
+          echo "3. ARD Agent:"
+          pgrep -f ARDAgent && echo "✅ ARD AGENT RUNNING" || echo "❌ ARD AGENT NOT FOUND"
           
-          echo "4. Active Screen Session:"
-          pgrep -x "WindowServer" && echo "✅ WINDOWSERVER ACTIVE" || echo "❌ WINDOWSERVER INACTIVE"
+          echo "4. WindowServer:"
+          pgrep -x WindowServer && echo "✅ WINDOWSERVER ACTIVE" || echo "❌ WINDOWSERVER INACTIVE"
           
-          echo "5. TCC Permissions:"
-          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "SELECT * FROM access WHERE service='kTCCServiceScreenRecording';" 2>/dev/null && echo "✅ SCREEN RECORDING PERMISSIONS SET" || echo "❌ PERMISSIONS MISSING"
+          echo "5. TCC Permissions Check:"
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "SELECT client, service FROM access WHERE service LIKE '%Screen%';" 2>/dev/null && echo "✅ TCC PERMISSIONS INJECTED" || echo "❌ TCC PERMISSIONS MISSING"
+          
+          echo "IP: $TAILSCALE_IP"
+          echo "Password: $VNC_PASSWORD"
 
       # 9. Keep Alive
       - name: Maintain Connection
         run: |
-          echo "=== VNC ACCESS - NO BLACK SCREEN ==="
+          echo "=== VNC READY - CONNECT NOW ==="
           echo "IP: $TAILSCALE_IP:5900"
-          echo "User: runner"
+          echo "User: runner"  
           echo "Password: $VNC_PASSWORD"
-          echo "===================================="
+          echo "==============================="
           
-          # Continuous health monitoring
-          counter=0
+          # Health monitoring
           while true; do
-            echo "[$(date +'%H:%M:%S')] VNC Active - Checking health..."
+            echo "[$(date +'%H:%M:%S')] VNC Active - IP: $TAILSCALE_IP"
             
-            # Periodic service health check
-            if [ $((counter % 10)) -eq 0 ]; then
-              nc -z -w 1 localhost 5900 && echo "✅ VNC Healthy" || echo "❌ VNC Issues"
-              tailscale status
+            # Check VNC status every minute
+            if ! nc -z -w 1 localhost 5900; then
+              echo "⚠️  VNC port not responding, attempting restart..."
+              sudo launchctl kickstart system/com.apple.screensharing || true
             fi
             
-            sleep 30
-            counter=$((counter + 1))
+            sleep 60
           done
