@@ -5,20 +5,17 @@ on:
 
 jobs:
   secure-vnc:
-    # Tetap gunakan macos-14 untuk stabilitas VNC
     runs-on: macos-14
     timeout-minutes: 360
 
     steps:
-      # Langkah 1: Siapkan VNC dan Password
-      # (Ini sudah berfungsi di log terakhir Anda)
+      # Langkah 1: Siapkan VNC dan Password (Tidak berubah)
       - name: Generate Password and Enable VNC
         run: |
           VNC_PASS=$(openssl rand -base64 12)
           echo "VNC_PASSWORD=$VNC_PASS" >> $GITHUB_ENV
           echo "Password VNC (akan muncul di log): $VNC_PASS"
           
-          # Perintah kickstart VNC dengan sintaks -users yang sudah benar
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate \
             -configure \
@@ -28,45 +25,48 @@ jobs:
             -restart -agent \
             -privs -all -users runner
 
-      # Langkah 2: Gunakan Action Resmi Tailscale
-      # Ini adalah PERUBAHAN UTAMA untuk menghindari error 'Killed: 9'
-      - name: Install and Connect Tailscale
-        uses: tailscale/github-action@v2
-        with:
-          # Gunakan secret Anda
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          # Buat hostname yang unik
-          hostname: gh-runner-macos-${{ github.run_id }}
-          
-      # Langkah 3: Dapatkan IP Tailscale
-      # Kita perlu langkah ini karena action di atas tidak otomatis 
-      # menyimpan IP ke GITHUB_ENV
-      - name: Get Tailscale IP
+      # Langkah 2: PERUBAHAN - Install Tailscale via Homebrew
+      - name: Install Tailscale via Homebrew
+        run: brew install tailscale
+
+      # Langkah 3: PERUBAHAN - Hubungkan Tailscale (Manual)
+      - name: Establish Tailscale Connection
         run: |
+          # Dapatkan path tailscale dari Homebrew (biasanya /opt/homebrew/bin/tailscale)
+          TS_BIN=$(which tailscale)
+          echo "Tailscale binary found at: $TS_BIN"
+          
+          # Gunakan 'nohup' dan '&' untuk menjalankan di background
+          # Ini untuk menghindari error 'Killed: 9 / Error 137'
+          echo "Menjalankan Tailscale up di background..."
+          nohup sudo $TS_BIN up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=gh-runner-macos-$GITHUB_RUN_ID &
+          
+          # Beri waktu 10 detik agar Tailscale daemon stabil
+          echo "Menunggu 10 detik agar Tailscale terhubung..."
+          sleep 10
+          
+          # Tunggu Tailscale mendapatkan IP
           tsIP=""
           retries=0
-          # Beri waktu 5 detik agar IP ter-assign
-          echo "Menunggu Tailscale mendaftarkan IP..."
-          sleep 5 
-          
           while [ -z "$tsIP" ] && [ $retries -lt 10 ]; do
             echo "Mencari IP Tailscale... (Percobaan $((retries+1)))"
-            # Path-nya sama, kita hanya perlu query IP
-            tsIP=$(/Applications/Tailscale.app/Contents/MacOS/Tailscale ip -4)
-            sleep 3
+            tsIP=$($TS_BIN ip -4)
+            sleep 5
             retries=$((retries + 1))
           done
-
+          
           if [ -z "$tsIP" ]; then
-            echo "::error::Gagal mendapatkan IP Tailscale setelah action."
-            /Applications/Tailscale.app/Contents/MacOS/Tailscale status
+            echo "::error::Gagal mendapatkan IP Tailscale. Keluar."
+            $TS_BIN status
             exit 1
           fi
           
           echo "TAILSCALE_IP=$tsIP" >> $GITHUB_ENV
           echo "IP Tailscale berhasil didapat: $tsIP"
 
-      # Langkah 4: Verifikasi Port VNC (Opsional tapi bagus)
+      # Langkah 4: Verifikasi Port VNC (Tidak berubah)
       - name: Verify VNC Accessibility
         run: |
           echo "Tailscale IP: $TAILSCALE_IP"
@@ -81,6 +81,9 @@ jobs:
       # Langkah 5: Jaga Koneksi (Final)
       - name: Maintain Connection
         run: |
+          # Dapatkan path tailscale lagi
+          TS_BIN=$(which tailscale)
+        
           echo ""
           echo "=== VNC ACCESS ==="
           echo "http://www.youtube.com/@TipsUNIX"
@@ -94,6 +97,6 @@ jobs:
           while true; do
             echo "[$(date)] VNC Aktif - Gunakan 'Cancel workflow' untuk menghentikan"
             # Tampilkan status Tailscale untuk debugging
-            /Applications/Tailscale.app/Contents/MacOS/Tailscale status
+            $TS_BIN status
             sleep 300
           done
